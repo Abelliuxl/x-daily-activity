@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 今日发帖 / 回复统计
 // @namespace    https://github.com/Abelliuxl/x-daily-activity
-// @version      0.1.1
+// @version      0.1.2
 // @description  在 X 页面右上角显示今日主动发帖数和回复数，支持拖动和自动同步。
 // @author       Abelliuxl
 // @match        https://x.com/*
@@ -35,6 +35,8 @@
   let lastSyncStartedAt = 0;
   let bundleCache = null;
   let observedGraphQLBase = null;
+  let lastPassiveUpdateAt = 0;
+  let directSyncBlockedUntil = 0;
 
   function emptyState() {
     return { version: 1, userId: null, days: {}, lastSyncAt: 0 };
@@ -136,11 +138,13 @@
     return [...found.values()];
   }
 
-  function ingestData(data, expectedUserId = currentUserId) {
+  function ingestData(data, expectedUserId = currentUserId, { source = 'passive' } = {}) {
     const tweets = collectTweets(data);
     let changed = false;
+    let ownTweetCount = 0;
     for (const tweet of tweets) {
       if (!expectedUserId || tweet.authorId !== String(expectedUserId) || tweet.kind === 'retweet') continue;
+      ownTweetCount += 1;
       const key = dateKey(tweet.createdAt);
       const day = ensureDay(key);
       const next = { kind: tweet.kind, createdAt: tweet.createdAt };
@@ -152,6 +156,10 @@
     if (changed) {
       saveState();
       render();
+    }
+    if (source === 'passive' && ownTweetCount > 0) {
+      lastPassiveUpdateAt = Date.now();
+      if (!syncPromise) setStatus(`实时监听中 · ${formatTime(lastPassiveUpdateAt)}`, 'ok');
     }
     return tweets;
   }
@@ -302,6 +310,12 @@
     'longform_notetweets_inline_media_enabled'
   ]);
 
+  function requestError(message, status = 0) {
+    const error = new Error(message);
+    error.status = status;
+    return error;
+  }
+
   async function graphQL(operation, variables, bundleText) {
     const csrf = readCookie('ct0');
     if (!csrf) throw new Error('未检测到 X 登录会话');
@@ -346,7 +360,7 @@
         return data;
       }
       const message = data?.errors?.[0]?.message || `X 请求失败 (${response.status})`;
-      lastError = new Error(message);
+      lastError = requestError(message, response.status);
       if (![403, 404].includes(response.status) || index === bases.length - 1) throw lastError;
     }
     throw lastError || new Error('X 请求失败');
@@ -418,6 +432,7 @@
 
   async function syncTimeline({ manual = false } = {}) {
     if (syncPromise) return syncPromise;
+    if (!manual && Date.now() < directSyncBlockedUntil) return;
     if (!manual && Date.now() - lastSyncStartedAt < 30_000) return;
     lastSyncStartedAt = Date.now();
     setStatus('正在同步…', 'working');
@@ -442,7 +457,7 @@
           ...(cursor ? { cursor } : {})
         };
         const data = await graphQL(operation, variables, text);
-        const allTweets = ingestData(data, currentUserId);
+        const allTweets = ingestData(data, currentUserId, { source: 'direct' });
         const chronological = collectChronologicalTweets(data);
         const relevant = (chronological.length ? chronological : allTweets)
           .filter((tweet) => tweet.authorId === currentUserId);
@@ -464,12 +479,20 @@
       state.lastSyncAt = Date.now();
       saveState();
       render();
-      const time = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
-        .format(state.lastSyncAt);
+      const time = formatTime(state.lastSyncAt);
       setStatus(complete ? `已同步 ${time}` : `已同步前 ${MAX_SYNC_PAGES} 页`, complete ? 'ok' : 'warning');
     })().catch((error) => {
       console.warn('[X Daily Activity] 同步失败', error);
-      setStatus(error.message || '同步失败', 'error');
+      if ([403, 404].includes(error.status) || /\b(?:403|404)\b/.test(error.message || '')) {
+        directSyncBlockedUntil = Date.now() + 6 * 60 * 60 * 1000;
+        if (lastPassiveUpdateAt) {
+          setStatus(`实时监听中 · ${formatTime(lastPassiveUpdateAt)}`, 'ok');
+        } else {
+          setStatus('实时监听中；打开个人主页可回填', 'warning');
+        }
+      } else {
+        setStatus(error.message || '同步失败', 'error');
+      }
     }).finally(() => {
       syncPromise = null;
     });
@@ -482,6 +505,10 @@
       posts: items.filter((item) => item.kind === 'post').length,
       replies: items.filter((item) => item.kind === 'reply').length
     };
+  }
+
+  function formatTime(value) {
+    return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(value);
   }
 
   function mountUi() {
@@ -524,7 +551,7 @@
       <section class="card" aria-label="X 今日活动统计">
         <div class="head">
           <div class="title">X 今日活动</div>
-          <button class="refresh" type="button" title="立即同步" aria-label="立即同步">↻</button>
+          <button class="refresh" type="button" title="重试全量回填" aria-label="重试全量回填">↻</button>
         </div>
         <div class="date"></div>
         <div class="stats">

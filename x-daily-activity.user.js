@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X 今日发帖 / 回复统计
 // @namespace    https://github.com/Abelliuxl/x-daily-activity
-// @version      0.1.0
+// @version      0.1.1
 // @description  在 X 页面右上角显示今日主动发帖数和回复数，支持拖动和自动同步。
 // @author       Abelliuxl
 // @match        https://x.com/*
@@ -34,6 +34,7 @@
   let syncPromise = null;
   let lastSyncStartedAt = 0;
   let bundleCache = null;
+  let observedGraphQLBase = null;
 
   function emptyState() {
     return { version: 1, userId: null, days: {}, lastSyncAt: 0 };
@@ -195,9 +196,18 @@
     return /\/(?:graphql|i\/api)\//.test(url) || /Tweet|Timeline|Viewer/.test(url);
   }
 
+  function rememberGraphQLBase(url) {
+    try {
+      const parsed = new URL(url, location.href);
+      const match = parsed.pathname.match(/^(.*\/graphql)\/[^/]+\/[^/?]+/);
+      if (match) observedGraphQLBase = `${parsed.origin}${match[1]}`;
+    } catch {}
+  }
+
   function installNetworkObserver() {
     PAGE.fetch = async function observedFetch(input, init) {
       const details = requestDetails(input, init);
+      rememberGraphQLBase(details.url);
       const response = await nativeFetch(input, init);
       if (response.ok && shouldInspect(details.url)) {
         const deletedId = deletedTweetId(details.url, details.body);
@@ -213,6 +223,7 @@
     const nativeSend = NativeXHR.prototype.send;
     NativeXHR.prototype.open = function observedOpen(method, url, ...rest) {
       this.__xdaUrl = String(url || '');
+      rememberGraphQLBase(this.__xdaUrl);
       return nativeOpen.call(this, method, url, ...rest);
     };
     NativeXHR.prototype.send = function observedSend(body) {
@@ -301,23 +312,44 @@
       features: JSON.stringify(features),
       fieldToggles: JSON.stringify(fieldToggles)
     });
-    const url = `${location.origin}/i/api/graphql/${operation.queryId}/${operation.operationName}?${params}`;
-    const response = await nativeFetch(url, {
-      credentials: 'include',
-      headers: {
-        authorization: `Bearer ${discoverBearer(bundleText)}`,
-        'x-csrf-token': csrf,
-        'x-twitter-active-user': 'yes',
-        'x-twitter-auth-type': 'OAuth2Session',
-        'x-twitter-client-language': document.documentElement.lang || 'zh-cn'
+    const apiOrigin = location.hostname.endsWith('twitter.com') ? 'https://api.twitter.com' : 'https://api.x.com';
+    const bases = [...new Set([
+      observedGraphQLBase,
+      `${apiOrigin}/graphql`,
+      `${location.origin}/i/api/graphql`
+    ].filter(Boolean))];
+    let lastError = null;
+
+    for (let index = 0; index < bases.length; index += 1) {
+      const base = bases[index];
+      const url = `${base}/${operation.queryId}/${operation.operationName}?${params}`;
+      let response;
+      try {
+        response = await nativeFetch(url, {
+          credentials: 'include',
+          headers: {
+            authorization: `Bearer ${discoverBearer(bundleText)}`,
+            'x-csrf-token': csrf,
+            'x-twitter-active-user': 'yes',
+            'x-twitter-auth-type': 'OAuth2Session',
+            'x-twitter-client-language': document.documentElement.lang || 'zh-cn'
+          }
+        });
+      } catch (error) {
+        lastError = error;
+        if (index === bases.length - 1) throw error;
+        continue;
       }
-    });
-    const data = await response.json().catch(() => null);
-    if (!response.ok || !data) {
+      const data = await response.json().catch(() => null);
+      if (response.ok && data) {
+        observedGraphQLBase = base;
+        return data;
+      }
       const message = data?.errors?.[0]?.message || `X 请求失败 (${response.status})`;
-      throw new Error(message);
+      lastError = new Error(message);
+      if (![403, 404].includes(response.status) || index === bases.length - 1) throw lastError;
     }
-    return data;
+    throw lastError || new Error('X 请求失败');
   }
 
   function findViewerUserId(root) {
